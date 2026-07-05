@@ -1,10 +1,7 @@
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, Body
 import requests
 import json
 import re
-import random
-import string
 import anthropic
 from sentence_transformers import SentenceTransformer, util
 from datetime import date
@@ -17,53 +14,17 @@ ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
 JOOBLE_API_KEY = os.environ.get("JOOBLE_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-# InfinityFree does not allow remote MySQL access, so all database work
-# happens through components/python_bridge.php on the PHP site instead of
-# a direct MySQL connection.
-BRIDGE_URL = os.environ.get("BRIDGE_URL", "")   # e.g. https://yoursite.infinityfreeapp.com/components/python_bridge.php
-BRIDGE_KEY = os.environ.get("BRIDGE_KEY", "")
-
 embedder      = SentenceTransformer("all-MiniLM-L6-v2")
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-
-def uid():
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=20))
-
-
-# InfinityFree's firewall silently drops requests without a browser-like
-# User-Agent (e.g. the default "python-requests/x.x" one), so the bridge
-# calls need to look like they come from a browser.
-BRIDGE_HEADERS = {
-    "X-Bridge-Key": BRIDGE_KEY,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-}
+# This service is stateless and never touches the database directly —
+# InfinityFree (where the DB lives) blocks inbound requests from external
+# services behind an anti-bot firewall, so PHP always initiates: it reads
+# whatever data an endpoint here needs, sends it in the request body, and
+# writes whatever comes back to the database itself.
 
 
-def bridge_get(action: str, params: dict = None) -> dict:
-    resp = requests.get(
-        BRIDGE_URL,
-        params={"action": action, **(params or {})},
-        headers=BRIDGE_HEADERS,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def bridge_post(action: str, json_body: dict = None) -> dict:
-    resp = requests.post(
-        BRIDGE_URL,
-        params={"action": action},
-        json=json_body or {},
-        headers=BRIDGE_HEADERS,
-        timeout=15,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-# ── 1. Fetch jobs from Adzuna ─────────────────────────────────────────────────
+# ── 1. Fetch jobs from Adzuna / Jooble ────────────────────────────────────────
 
 @app.post("/fetch-jobs")
 def fetch_jobs(
@@ -72,12 +33,13 @@ def fetch_jobs(
     pages:    int = Query(1),
     country:  str = Query("gb")
 ):
-    stored = 0
     ADZUNA_SUPPORTED = {"gb","us","au","de","fr","nl","pl","it","ca","za","sg","in","br","nz"}
 
     if country not in ADZUNA_SUPPORTED:
-        stored = _fetch_jooble(query, country, pages)
+        jobs = _fetch_jooble(query, country, pages)
+        source = "Jooble"
     else:
+        jobs = []
         for page in range(1, pages + 1):
             resp = requests.get(
                 f"https://api.adzuna.com/v1/api/jobs/{country}/search/{page}",
@@ -94,22 +56,21 @@ def fetch_jobs(
             resp.raise_for_status()
 
             for j in resp.json().get("results", []):
-                result = bridge_post("upsert-job", {
+                jobs.append({
                     "external_id":  str(j["id"]),
-                    "title":        j.get("title", ""),
-                    "company":      j.get("company", {}).get("display_name", ""),
-                    "location":     j.get("location", {}).get("display_name", ""),
+                    "title":        j.get("title", "")[:200],
+                    "company":      j.get("company", {}).get("display_name", "")[:200],
+                    "location":     j.get("location", {}).get("display_name", "")[:200],
                     "description":  j.get("description", ""),
-                    "redirect_url": j.get("redirect_url", ""),
+                    "redirect_url": j.get("redirect_url", "")[:500],
                     "salary_min":   j.get("salary_min"),
                     "salary_max":   j.get("salary_max"),
                     "date_fetched": date.today().isoformat(),
                     "country":      country,
                 })
-                if result.get("inserted"):
-                    stored += 1
+        source = "Adzuna"
 
-    return {"stored": stored, "sources": ["Adzuna"] if country in ADZUNA_SUPPORTED else ["Jooble"]}
+    return {"jobs": jobs, "source": source}
 
 
 JOOBLE_COUNTRY_NAMES = {
@@ -125,9 +86,9 @@ def debug_jooble(query: str = Query("developer"), location: str = Query("Romania
     )
     return {"status": resp.status_code, "body": resp.json()}
 
-def _fetch_jooble(query: str, country: str, pages: int) -> int:
+def _fetch_jooble(query: str, country: str, pages: int) -> list:
     country_name = JOOBLE_COUNTRY_NAMES.get(country, country.upper())
-    stored = 0
+    jobs = []
     for page in range(1, pages + 1):
         resp = requests.post(
             f"https://jooble.org/api/{JOOBLE_API_KEY}",
@@ -142,31 +103,26 @@ def _fetch_jooble(query: str, country: str, pages: int) -> int:
         resp.raise_for_status()
 
         for j in resp.json().get("jobs", []):
-            result = bridge_post("upsert-job", {
-                "external_id":  "jooble_" + str(j.get("id", uid())),
-                "title":        j.get("title", ""),
-                "company":      j.get("company", ""),
-                "location":     j.get("location", ""),
+            jobs.append({
+                "external_id":  "jooble_" + str(j.get("id", "")),
+                "title":        j.get("title", "")[:200],
+                "company":      j.get("company", "")[:200],
+                "location":     j.get("location", "")[:200],
                 "description":  j.get("snippet", ""),
-                "redirect_url": j.get("link", ""),
+                "redirect_url": j.get("link", "")[:500],
                 "salary_min":   None,
                 "salary_max":   None,
                 "date_fetched": date.today().isoformat(),
                 "country":      country,
             })
-            if result.get("inserted"):
-                stored += 1
-    return stored
+    return jobs
 
 
-# ── 2. Extract skills from one job using Claude ───────────────────────────────
+# ── 2. Extract skills from a job description using Claude ────────────────────
 
-@app.post("/extract-skills/{job_id}")
-def extract_skills(job_id: str):
-    job_resp = bridge_get("job", {"id": job_id})
-    job = job_resp.get("job")
-    if not job:
-        return JSONResponse(status_code=404, content={"error": "Job not found"})
+@app.post("/extract-skills")
+def extract_skills(payload: dict = Body(...)):
+    description = payload.get("description", "")
 
     msg = claude_client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -177,7 +133,7 @@ def extract_skills(job_id: str):
                 "Extract all technical and professional skills from this job description. "
                 "Return ONLY a valid JSON array of skill name strings, nothing else.\n"
                 "Example: [\"Python\", \"React\", \"SQL\", \"Communication\"]\n\n"
-                f"Job description:\n{job['description'][:3000]}"
+                f"Job description:\n{description[:3000]}"
             )
         }]
     )
@@ -189,39 +145,24 @@ def extract_skills(job_id: str):
         match = re.search(r'\[.*?\]', raw, re.DOTALL)
         extracted = json.loads(match.group()) if match else []
 
-    skills_payload = []
+    skills = []
     for skill_name in extracted:
         skill_name = skill_name.strip()[:100]
         if not skill_name:
             continue
-        skills_payload.append({"name": skill_name, "category": _guess_category(skill_name)})
+        skills.append({"name": skill_name, "category": _guess_category(skill_name)})
 
-    tag_result = bridge_post("tag-job-skills", {"job_id": job_id, "skills": skills_payload})
-
-    return {"job_id": job_id, "skills_extracted": tag_result.get("tagged", [])}
+    return {"skills": skills}
 
 
-# ── 3. Batch-process all unprocessed jobs ────────────────────────────────────
+# ── 3. Recommend courses for a student ────────────────────────────────────────
 
-@app.post("/extract-all-skills")
-def extract_all_skills():
-    jobs = bridge_get("unprocessed-jobs").get("job_ids", [])
-    results = [extract_skills(jid) for jid in jobs]
-    return {"processed": len(results)}
-
-
-# ── 4. Recommend courses for a student ───────────────────────────────────────
-
-@app.post("/recommend/{user_id}")
-def recommend(
-    user_id: str,
-    job_id:  str = Query(None),
-    top_n:   int = Query(5)
-):
-    user_skills = bridge_get("user-skills", {"user_id": user_id}).get("skills", [])
-
-    job_skills_params = {"job_id": job_id} if job_id else {}
-    target_skills = bridge_get("job-skills", job_skills_params).get("skills", [])
+@app.post("/recommend")
+def recommend(payload: dict = Body(...)):
+    user_skills   = payload.get("user_skills", [])
+    target_skills = payload.get("target_skills", [])
+    playlists     = payload.get("playlists", [])
+    top_n         = payload.get("top_n", 5)
 
     if not target_skills:
         return {"recommendations": [], "message": "No target skills found."}
@@ -241,8 +182,6 @@ def recommend(
 
     if not gap_skills:
         return {"recommendations": [], "message": "You already match all required skills!"}
-
-    playlists = bridge_get("tagged-playlists").get("playlists", [])
 
     if not playlists:
         return {"gap_skills": gap_skills, "recommendations": [], "message": "No tagged courses yet."}
@@ -267,18 +206,6 @@ def recommend(
         "gap_skills":    gap_skills,
         "recommendations": scored[:top_n]
     }
-
-
-# ── 5. Read-only helpers ──────────────────────────────────────────────────────
-
-@app.get("/jobs")
-def list_jobs(limit: int = Query(20), offset: int = Query(0)):
-    return {"jobs": bridge_get("jobs", {"limit": limit, "offset": offset}).get("jobs", [])}
-
-
-@app.get("/skills")
-def list_skills():
-    return {"skills": bridge_get("skills").get("skills", [])}
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
