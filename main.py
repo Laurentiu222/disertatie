@@ -31,11 +31,20 @@ def uid():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=20))
 
 
+# InfinityFree's firewall silently drops requests without a browser-like
+# User-Agent (e.g. the default "python-requests/x.x" one), so the bridge
+# calls need to look like they come from a browser.
+BRIDGE_HEADERS = {
+    "X-Bridge-Key": BRIDGE_KEY,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+}
+
+
 def bridge_get(action: str, params: dict = None) -> dict:
     resp = requests.get(
         BRIDGE_URL,
         params={"action": action, **(params or {})},
-        headers={"X-Bridge-Key": BRIDGE_KEY},
+        headers=BRIDGE_HEADERS,
         timeout=15,
     )
     resp.raise_for_status()
@@ -47,7 +56,7 @@ def bridge_post(action: str, json_body: dict = None) -> dict:
         BRIDGE_URL,
         params={"action": action},
         json=json_body or {},
-        headers={"X-Bridge-Key": BRIDGE_KEY},
+        headers=BRIDGE_HEADERS,
         timeout=15,
     )
     resp.raise_for_status()
